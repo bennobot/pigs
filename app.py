@@ -3,44 +3,38 @@ import pandas as pd
 import re
 import pytesseract
 from pdf2image import convert_from_bytes
+from PIL import Image
 
-st.set_page_config(page_title="Selfridges PO (OCR - MultiPage)", layout="wide")
-st.title("Selfridges PO Converter (OCR - MultiPage Fix)")
+st.set_page_config(page_title="Selfridges PO (HD OCR)", layout="wide")
+st.title("Selfridges PO Converter (High-Def OCR)")
+st.info("Scanning at 300 DPI for maximum accuracy. This takes a few seconds per page.")
 
 uploaded_file = st.file_uploader("Upload Selfridges PO PDF", type="pdf")
 
 if uploaded_file is not None:
     try:
-        # Reset file pointer to be safe
-        uploaded_file.seek(0)
-        file_bytes = uploaded_file.read()
-        
-        # Convert PDF to Images
-        # We explicitly ask for all pages
-        images = convert_from_bytes(file_bytes)
-        
-        st.info(f"PDF Loaded. Detected {len(images)} pages.")
+        # 1. CONVERT PDF TO IMAGES AT 300 DPI (Crucial for Page 2 and EANs)
+        # ------------------------------------------------------------------
+        images = convert_from_bytes(uploaded_file.read(), dpi=300)
         
         all_text_content = ""
         
-        # Extract text from EACH page
+        # 2. EXTRACT TEXT FROM EACH PAGE
+        # ------------------------------------------------------------------
         progress_bar = st.progress(0)
+        
         for i, image in enumerate(images):
-            status_text = f"Scanning Page {i+1} of {len(images)}..."
-            progress_bar.progress((i + 1) / len(images), text=status_text)
+            progress_bar.progress((i + 1) / len(images), text=f"Processing Page {i+1}...")
+            
+            # Convert to grayscale to improve text contrast
+            gray_image = image.convert('L')
             
             # Extract text
-            page_text = pytesseract.image_to_string(image)
-            
-            # Add a marker so we know where pages end in the raw text (for debugging)
-            all_text_content += f"\n--- PAGE {i+1} START ---\n"
-            all_text_content += page_text
-            all_text_content += f"\n--- PAGE {i+1} END ---\n"
+            page_text = pytesseract.image_to_string(gray_image)
+            all_text_content += page_text + "\n"
 
-        # Debug: Show the user exactly what was read from ALL pages
-        with st.expander("View Raw OCR Text (Check if Page 2 data is here)"):
-            st.text(all_text_content)
-
+        # 3. PARSE THE TEXT
+        # ------------------------------------------------------------------
         extracted_data = []
         lines = all_text_content.split('\n')
         
@@ -48,63 +42,74 @@ if uploaded_file is not None:
             clean_line = line.strip()
             if not clean_line: continue
 
-            # OCR Fixes: 0 vs O, l vs 1
-            clean_line_fixed = clean_line.replace('O', '0').replace('l', '1')
+            # Common OCR Fixes (replace letters that look like numbers)
+            # This helps fix prices like 18.44 appearing as l8.44
+            line_fixed = clean_line.replace('l', '1').replace('O', '0').replace('o', '0')
 
-            # Regex: Look for lines ending in two prices (Unit Cost and Line Cost)
-            # Matches: 18.44 442.56
-            cost_match = re.search(r"(\d+\.\d{2})\s+(\d{1,3}(?:,\d{3})*\.\d{2})$", clean_line_fixed)
+            # PATTERN: Look for lines ending with TWO decimal numbers
+            # Example: "24    18.44    442.56"
+            # Regex captures: (Unit Cost) (Space) (Total Cost) (End of Line)
+            cost_match = re.search(r"(\d+\.\d{2})\s+(\d{1,3}(?:,\d{3})*\.\d{2})$", line_fixed)
             
             if cost_match:
                 line_cost = cost_match.group(2)
                 unit_cost = cost_match.group(1)
                 
-                # Get text before the costs
+                # Get everything before the costs
                 remaining = clean_line[:cost_match.start()].strip()
                 parts = remaining.split()
                 
-                # Needs to be at least "LineNum SKU Qty" (3 parts) 
-                # or just "SKU Qty" if line number is merged
+                # We need at least 2 parts (SKU and Qty)
                 if len(parts) >= 2:
                     qty_candidate = parts[-1]
-                    # Clean non-digits from Qty (OCR noise)
+                    # Filter purely for digits (removes 'PC' or 'EA' noise if attached)
                     qty = ''.join(filter(str.isdigit, qty_candidate))
                     
                     if not qty: continue 
 
-                    # Attempt to find Line Number and SKU
+                    # Identify Line Number and SKU
                     line_num = ""
                     sku = ""
                     
-                    # Heuristic: If first part is small number (1-3 digits), it's Line Number
+                    # Heuristic: Line Number is usually 1-3 digits at the start
                     if parts[0].isdigit() and len(parts[0]) <= 3:
                         line_num = parts[0]
                         if len(parts) > 1:
                             sku = parts[1]
                     else:
-                        # Maybe Line number is missing or merged? Take first part as SKU
+                        # If Line number is missing/merged, assume first part is SKU
                         sku = parts[0]
 
-                    # Description & EAN Lookahead
+                    # -------------------------------------------------------
+                    # FIND DESCRIPTION & EAN (Look at next 6 lines)
+                    # -------------------------------------------------------
                     description = ""
                     ean = ""
                     
-                    # Look at next 5 lines
-                    next_lines = lines[i+1 : i+6]
-                    for nl in next_lines:
-                        # Skip page markers
-                        if "--- PAGE" in nl: continue
-                        
-                        # Stop if we hit a new item line (starts with digit, ends with price)
-                        if re.match(r"^\d+", nl.strip()) and re.search(r"\d+\.\d{2}$", nl.strip()):
-                            break
-                            
-                        if "EAN" in nl:
-                             ean_match = re.search(r"(\d{12,14})", nl)
-                             if ean_match: ean = ean_match.group(1)
-                        elif "WHITEBOX" in nl.upper() or "MARTINI" in nl.upper() or "NO COLOUR" in nl.upper():
-                             if not description: description = nl.strip()
+                    # Look ahead up to 6 lines (generous buffer)
+                    next_lines = lines[i+1 : i+7]
                     
+                    for nl in next_lines:
+                        nl_stripped = nl.strip()
+                        if not nl_stripped: continue
+                        
+                        # Stop searching if we hit the next product (starts with digit, ends with price)
+                        if re.match(r"^\d+", nl_stripped) and re.search(r"\d+\.\d{2}$", nl_stripped):
+                            break
+                        
+                        # EAN FINDER:
+                        # Look for any 12 to 14 digit number anywhere in these lines
+                        # We do NOT require the word "EAN" to be present, as OCR often misses it.
+                        ean_candidates = re.findall(r"\b(\d{12,14})\b", nl_stripped)
+                        if ean_candidates:
+                            ean = ean_candidates[0] # Take the first valid barcode found
+                        
+                        # DESCRIPTION FINDER:
+                        # If it's not an EAN line and not a page header, it's likely the description
+                        elif "CONTINUATION" not in nl_stripped and "PAGE:" not in nl_stripped:
+                             if not description:
+                                 description = nl_stripped
+
                     extracted_data.append({
                         "Line": line_num,
                         "Vendor Product Number": sku,
@@ -115,14 +120,28 @@ if uploaded_file is not None:
                         "Line Cost": line_cost
                     })
 
+        # 4. OUTPUT
+        # ------------------------------------------------------------------
         if extracted_data:
             df = pd.DataFrame(extracted_data)
-            st.success(f"Success! Found {len(df)} items across {len(images)} pages.")
+            
+            # Sort by Line Number just in case they were read out of order
+            # (Convert to numeric first for sorting)
+            try:
+                df['Line'] = pd.to_numeric(df['Line'])
+                df = df.sort_values('Line')
+            except:
+                pass # If line numbers aren't clean, skip sorting
+
+            st.success(f"Success! Found {len(df)} items.")
             st.dataframe(df)
+            
             csv = df.to_csv(index=False).encode('utf-8')
-            st.download_button("Download CSV", csv, "Selfridges_PO.csv", "text/csv")
+            st.download_button("Download CSV", csv, "Selfridges_PO_Final.csv", "text/csv")
         else:
-            st.error("No items found.")
+            st.error("No items found. Please check the 'Raw Text' below.")
+            with st.expander("Show Raw OCR Text for Debugging"):
+                st.text(all_text_content)
             
     except Exception as e:
         st.error(f"Error: {str(e)}")
