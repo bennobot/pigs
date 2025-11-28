@@ -3,126 +3,106 @@ import pdfplumber
 import pandas as pd
 import re
 
-st.title("Selfridges PO to CSV Converter (Robust)")
+st.set_page_config(layout="wide")
+st.title("Selfridges PO Converter (Diagnostic Mode)")
 
 uploaded_file = st.file_uploader("Upload Selfridges PO PDF", type="pdf")
 
 if uploaded_file is not None:
+    all_text_content = ""
     extracted_data = []
-    all_text_debug = "" # To store raw text for debugging
-    
+
     with pdfplumber.open(uploaded_file) as pdf:
-        # We iterate through all pages
-        lines_list = []
+        all_lines = []
         for page in pdf.pages:
-            # layout=True helps keep columns separated by spaces
-            text = page.extract_text(layout=True)
+            # We use basic extraction first (often safer than layout=True for simple lists)
+            text = page.extract_text()
             if text:
-                all_text_debug += f"--- PAGE {page.page_number} ---\n{text}\n"
-                lines_list.extend(text.split('\n'))
+                all_text_content += text + "\n"
+                all_lines.extend(text.split('\n'))
+
+    # --- SHOW RAW TEXT FOR DEBUGGING ---
+    with st.expander("Show Raw PDF Text (Click to Expand)", expanded=False):
+        st.text_area("This is exactly what the computer sees:", all_text_content, height=200)
+
+    # --- EXTRACTION LOGIC ---
+    for i, line in enumerate(all_lines):
+        # Clean the line
+        clean_line = line.strip()
+        if not clean_line:
+            continue
+
+        # Strategy: Find all numbers in the line
+        # This matches integers (24) and decimals (18.44) and totals (1,000.00)
+        # Regex: Optional comma, optional dot
+        numbers_found = re.findall(r'\d+(?:,\d{3})*(?:\.\d+)?', clean_line)
+
+        # A valid data line in your PO typically has at least 5 numbers:
+        # 1. Line # (e.g., "1")
+        # 2. Pack Size (e.g., "1" or "12")
+        # 3. Qty (e.g., "24")
+        # 4. Unit Cost (e.g., "18.44")
+        # 5. Line Cost (e.g., "442.56")
         
-        # LOGIC: Find lines that look like PO Items
-        # A PO line usually ends with: Qty -> Unit Cost -> Total Cost
-        # Example: "24    18.44    442.56"
-        # We search for lines ending in 2 decimal numbers
-        
-        for i, line in enumerate(lines_list):
-            clean_line = line.strip()
+        # We check if line starts with a Line Number and has enough numbers
+        if len(numbers_found) >= 4 and clean_line[0].isdigit():
             
-            # Skip empty lines
-            if not clean_line:
-                continue
-
-            # Regex: Look for lines ending with (Float) (Space) (Float)
-            # This captures: Unit Cost and Total Cost at the end of the line
-            # Example match: "18.44     442.56"
-            cost_pattern = re.search(r"(\d+\.\d{2})\s+(\d{1,3}(?:,\d{3})*\.\d{2})$", clean_line)
+            # Extract based on position of numbers (from the right)
+            line_cost = numbers_found[-1]
+            unit_cost = numbers_found[-2]
+            qty = numbers_found[-3]
             
-            if cost_pattern:
-                line_cost = cost_pattern.group(2)
-                unit_cost = cost_pattern.group(1)
+            # The Line Number is likely the very first character/word
+            line_num = numbers_found[0]
+            
+            # SKU is usually the text between Line Number and the Pack Size/Qty
+            # This is tricky, so we grab the text between the first space and the "EA" or "UN" markers
+            # Or simplified: The second "word" in the line
+            parts = clean_line.split()
+            sku = parts[1] if len(parts) > 1 else "Unknown"
+
+            # --- DESCRIPTION & EAN LOOKUP ---
+            description = ""
+            ean = ""
+            
+            # Look at the next 4 lines
+            # Be careful not to go out of bounds
+            max_lookahead = min(len(all_lines), i + 5)
+            next_lines = all_lines[i+1 : max_lookahead]
+            
+            for nl in next_lines:
+                nl_clean = nl.strip()
+                if not nl_clean: continue
                 
-                # Now we try to find the other parts in the same line
-                # Remove the costs we just found to analyze the rest
-                remaining_text = clean_line[:cost_pattern.start()].strip()
+                # Stop if we hit a new line starting with a number
+                if nl_clean[0].isdigit() and len(re.findall(r'\d+', nl_clean)) > 2:
+                    break
                 
-                # The Qty should be the number right before the Unit Cost
-                # We split the remaining text by spaces to find the last number
-                parts = remaining_text.split()
-                if parts and parts[-1].isdigit():
-                    qty = parts[-1]
-                    # Everything before the Qty is the Product/SKU info
-                    # Usually: LineNumber SKU Unit PackSize
-                    # But sometimes just: LineNumber SKU
-                    
-                    # Let's assume the very first part is the Line Number if it's digit
-                    line_num = ""
-                    sku = ""
-                    
-                    product_parts = parts[:-1] # Remove Qty
-                    
-                    if product_parts:
-                        if product_parts[0].isdigit():
-                            line_num = product_parts[0]
-                            # SKU is likely the next chunk
-                            if len(product_parts) > 1:
-                                sku = product_parts[1]
-                        else:
-                            # Maybe line number is missing or merged? Just grab first part as SKU
-                            sku = product_parts[0]
+                if "EAN" in nl.upper():
+                    ean_match = re.search(r"(\d{12,14})", nl)
+                    if ean_match:
+                        ean = ean_match.group(1)
+                elif "WHITEBOX" in nl.upper() or "MARTINI" in nl.upper() or "NO COLOUR" in nl.upper():
+                    # This is likely the description
+                    description = nl_clean
 
-                    # -----------------------------------------------
-                    # GET DESCRIPTION & EAN (Look at lines below)
-                    # -----------------------------------------------
-                    description = ""
-                    ean = ""
-                    
-                    # Look at the next few lines (up to 4) to find Description and EAN
-                    next_lines = lines_list[i+1 : i+5]
-                    
-                    for nl in next_lines:
-                        nl_stripped = nl.strip()
-                        if not nl_stripped: continue
-                        
-                        # Stop if we hit a new line item (starts with a digit and looks like a price line)
-                        if re.search(r"\d+\.\d{2}$", nl_stripped) and re.match(r"^\d+", nl_stripped):
-                            break
-                        
-                        if "EAN NO" in nl.upper():
-                            # Extract EAN digits
-                            ean_match = re.search(r"(\d{12,14})", nl)
-                            if ean_match:
-                                ean = ean_match.group(1)
-                        elif "NO COLOUR" in nl.upper() or "WHITEBOX" in nl.upper() or "MARTINI" in nl.upper():
-                            # This is likely the description line
-                            description = nl_stripped
+            extracted_data.append({
+                "Line": line_num,
+                "Vendor Product Number": sku,
+                "Description": description,
+                "EAN No": ean,
+                "Qty": qty,
+                "Unit Cost": unit_cost,
+                "Line Cost": line_cost
+            })
 
-                    extracted_data.append({
-                        "Line": line_num,
-                        "Vendor Product Number": sku,
-                        "Description": description,
-                        "EAN No": ean,
-                        "Qty": qty,
-                        "Unit Cost (GBP)": unit_cost,
-                        "Line Cost (GBP)": line_cost
-                    })
-
-    # Output results
     if extracted_data:
         df = pd.DataFrame(extracted_data)
-        st.success(f"Success! Extracted {len(df)} items.")
+        st.success(f"Success! Found {len(df)} items.")
         st.dataframe(df)
         
         csv = df.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="Download CSV",
-            data=csv,
-            file_name="Selfridges_PO_Converted.csv",
-            mime="text/csv",
-        )
+        st.download_button("Download CSV", csv, "Selfridges_PO.csv", "text/csv")
     else:
-        st.error("Still no items found. Check the Debug Information below to see why.")
-        
-        with st.expander("Show Debug Information (Raw Text)"):
-            st.text(all_text_debug)
-            st.write("Copy the text above and share it if you need further help.")
+        st.error("Still no items found.")
+        st.warning("Please copy the content from the 'Show Raw PDF Text' box above and share it, so I can adjust the logic.")
