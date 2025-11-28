@@ -3,72 +3,99 @@ import pdfplumber
 import pandas as pd
 import re
 
-st.title("Selfridges PO to CSV Converter")
+st.title("Selfridges PO to CSV Converter (Robust)")
 
-# File uploader
 uploaded_file = st.file_uploader("Upload Selfridges PO PDF", type="pdf")
 
 if uploaded_file is not None:
     extracted_data = []
+    all_text_debug = "" # To store raw text for debugging
     
     with pdfplumber.open(uploaded_file) as pdf:
-        # Combine text from all pages into one big list of lines
-        all_text = ""
+        # We iterate through all pages
+        lines_list = []
         for page in pdf.pages:
-            extracted_text = page.extract_text()
-            if extracted_text:
-                all_text += extracted_text + "\n"
+            # layout=True helps keep columns separated by spaces
+            text = page.extract_text(layout=True)
+            if text:
+                all_text_debug += f"--- PAGE {page.page_number} ---\n{text}\n"
+                lines_list.extend(text.split('\n'))
         
-        lines = all_text.split('\n')
+        # LOGIC: Find lines that look like PO Items
+        # A PO line usually ends with: Qty -> Unit Cost -> Total Cost
+        # Example: "24    18.44    442.56"
+        # We search for lines ending in 2 decimal numbers
         
-        # Regex to find the start of a line item.
-        # It looks for: Start of line -> Number -> Space -> SKU (Letters/Numbers)
-        # Example: "1 L-WHBOCLCO..."
-        item_start_pattern = re.compile(r"^\s*(\d+)\s+([A-Z0-9-]+)")
-        
-        for i, line in enumerate(lines):
-            match = item_start_pattern.match(line)
+        for i, line in enumerate(lines_list):
+            clean_line = line.strip()
             
-            # If we find a line starting with a number and SKU
-            if match:
-                line_num = match.group(1)
-                sku = match.group(2)
+            # Skip empty lines
+            if not clean_line:
+                continue
+
+            # Regex: Look for lines ending with (Float) (Space) (Float)
+            # This captures: Unit Cost and Total Cost at the end of the line
+            # Example match: "18.44     442.56"
+            cost_pattern = re.search(r"(\d+\.\d{2})\s+(\d{1,3}(?:,\d{3})*\.\d{2})$", clean_line)
+            
+            if cost_pattern:
+                line_cost = cost_pattern.group(2)
+                unit_cost = cost_pattern.group(1)
                 
-                # Extract the numbers at the end of the line (Qty, Unit Cost, Total Cost)
-                # We look for decimal numbers or integers at the end of the string
-                # Example end of line: "... 24 18.44 442.56"
-                numbers = re.findall(r"(\d+(?:\.\d{2})?)", line)
+                # Now we try to find the other parts in the same line
+                # Remove the costs we just found to analyze the rest
+                remaining_text = clean_line[:cost_pattern.start()].strip()
                 
-                # We expect at least 3 numbers at the end (Qty, Unit Cost, Line Cost)
-                if len(numbers) >= 3:
-                    line_cost = numbers[-1]
-                    unit_cost = numbers[-2]
-                    qty = numbers[-3]
+                # The Qty should be the number right before the Unit Cost
+                # We split the remaining text by spaces to find the last number
+                parts = remaining_text.split()
+                if parts and parts[-1].isdigit():
+                    qty = parts[-1]
+                    # Everything before the Qty is the Product/SKU info
+                    # Usually: LineNumber SKU Unit PackSize
+                    # But sometimes just: LineNumber SKU
                     
-                    # -----------------------------------------------
-                    # GET DESCRIPTION (Usually the NEXT line)
-                    # -----------------------------------------------
-                    description = ""
-                    if i + 1 < len(lines):
-                        # The description is on the line immediately following the SKU line
-                        description_line = lines[i+1].strip()
-                        # Verify it's not a new item or an EAN line
-                        if "EAN NO" not in description_line and not item_start_pattern.match(description_line):
-                            description = description_line
+                    # Let's assume the very first part is the Line Number if it's digit
+                    line_num = ""
+                    sku = ""
+                    
+                    product_parts = parts[:-1] # Remove Qty
+                    
+                    if product_parts:
+                        if product_parts[0].isdigit():
+                            line_num = product_parts[0]
+                            # SKU is likely the next chunk
+                            if len(product_parts) > 1:
+                                sku = product_parts[1]
+                        else:
+                            # Maybe line number is missing or merged? Just grab first part as SKU
+                            sku = product_parts[0]
 
                     # -----------------------------------------------
-                    # GET EAN (Usually 2 lines down, containing "EAN NO")
+                    # GET DESCRIPTION & EAN (Look at lines below)
                     # -----------------------------------------------
+                    description = ""
                     ean = ""
-                    # Check line i+1 (if desc was short) or i+2
-                    check_range = lines[i+1:i+4] # Look at next 3 lines just to be safe
-                    for subline in check_range:
-                        if "EAN NO" in subline:
-                            # Extract just the digits from the EAN line
-                            ean_match = re.search(r"EAN NO:\s*(\d+)", subline)
+                    
+                    # Look at the next few lines (up to 4) to find Description and EAN
+                    next_lines = lines_list[i+1 : i+5]
+                    
+                    for nl in next_lines:
+                        nl_stripped = nl.strip()
+                        if not nl_stripped: continue
+                        
+                        # Stop if we hit a new line item (starts with a digit and looks like a price line)
+                        if re.search(r"\d+\.\d{2}$", nl_stripped) and re.match(r"^\d+", nl_stripped):
+                            break
+                        
+                        if "EAN NO" in nl.upper():
+                            # Extract EAN digits
+                            ean_match = re.search(r"(\d{12,14})", nl)
                             if ean_match:
                                 ean = ean_match.group(1)
-                            break
+                        elif "NO COLOUR" in nl.upper() or "WHITEBOX" in nl.upper() or "MARTINI" in nl.upper():
+                            # This is likely the description line
+                            description = nl_stripped
 
                     extracted_data.append({
                         "Line": line_num,
@@ -83,12 +110,9 @@ if uploaded_file is not None:
     # Output results
     if extracted_data:
         df = pd.DataFrame(extracted_data)
-        
-        # Show a preview on screen
-        st.success(f"Successfully extracted {len(df)} line items.")
+        st.success(f"Success! Extracted {len(df)} items.")
         st.dataframe(df)
         
-        # Create CSV download
         csv = df.to_csv(index=False).encode('utf-8')
         st.download_button(
             label="Download CSV",
@@ -97,4 +121,8 @@ if uploaded_file is not None:
             mime="text/csv",
         )
     else:
-        st.error("No line items found. Please ensure this is a standard Selfridges PO.")
+        st.error("Still no items found. Check the Debug Information below to see why.")
+        
+        with st.expander("Show Debug Information (Raw Text)"):
+            st.text(all_text_debug)
+            st.write("Copy the text above and share it if you need further help.")
