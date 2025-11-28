@@ -3,38 +3,38 @@ import pandas as pd
 import re
 import pytesseract
 from pdf2image import convert_from_bytes
-from PIL import Image
 
-st.set_page_config(page_title="Selfridges PO (HD OCR)", layout="wide")
-st.title("Selfridges PO Converter (High-Def OCR)")
-st.info("Scanning at 300 DPI for maximum accuracy. This takes a few seconds per page.")
+st.set_page_config(page_title="Selfridges PO (PSM6 Fix)", layout="wide")
+st.title("Selfridges PO Converter (Layout Fix)")
+st.info("Applying 'Single Block' extraction mode to fix column misalignment.")
 
 uploaded_file = st.file_uploader("Upload Selfridges PO PDF", type="pdf")
 
 if uploaded_file is not None:
     try:
-        # 1. CONVERT PDF TO IMAGES AT 300 DPI (Crucial for Page 2 and EANs)
-        # ------------------------------------------------------------------
+        # 1. Convert PDF to Images (300 DPI for clarity)
         images = convert_from_bytes(uploaded_file.read(), dpi=300)
         
         all_text_content = ""
         
-        # 2. EXTRACT TEXT FROM EACH PAGE
-        # ------------------------------------------------------------------
-        progress_bar = st.progress(0)
+        # 2. Configure OCR to force Left-to-Right reading
+        # --psm 6 assumes a single uniform block of text. 
+        # This stops it from reading columns top-to-bottom.
+        custom_config = r'--psm 6'
         
         for i, image in enumerate(images):
-            progress_bar.progress((i + 1) / len(images), text=f"Processing Page {i+1}...")
-            
-            # Convert to grayscale to improve text contrast
+            # Convert to grayscale
             gray_image = image.convert('L')
             
-            # Extract text
-            page_text = pytesseract.image_to_string(gray_image)
+            # Extract with the specific config
+            page_text = pytesseract.image_to_string(gray_image, config=custom_config)
             all_text_content += page_text + "\n"
 
-        # 3. PARSE THE TEXT
-        # ------------------------------------------------------------------
+        # Show the user the fixed layout
+        with st.expander("Check Raw Text (Should now be aligned Left-to-Right)"):
+            st.text(all_text_content)
+
+        # 3. Parse the data
         extracted_data = []
         lines = all_text_content.split('\n')
         
@@ -42,106 +42,91 @@ if uploaded_file is not None:
             clean_line = line.strip()
             if not clean_line: continue
 
-            # Common OCR Fixes (replace letters that look like numbers)
-            # This helps fix prices like 18.44 appearing as l8.44
+            # Fix OCR common errors
             line_fixed = clean_line.replace('l', '1').replace('O', '0').replace('o', '0')
 
-            # PATTERN: Look for lines ending with TWO decimal numbers
-            # Example: "24    18.44    442.56"
-            # Regex captures: (Unit Cost) (Space) (Total Cost) (End of Line)
-            cost_match = re.search(r"(\d+\.\d{2})\s+(\d{1,3}(?:,\d{3})*\.\d{2})$", line_fixed)
+            # Look for the Line Item pattern:
+            # Starts with a Line Number (1-3 digits) -> Space -> SKU -> ... -> Two Prices at end
             
-            if cost_match:
-                line_cost = cost_match.group(2)
-                unit_cost = cost_match.group(1)
+            # Regex Explanation:
+            # ^(\d{1,3})       = Start with 1-3 digits (Line Num)
+            # \s+              = Space
+            # ([A-Z0-9-]+)     = SKU (Letters, numbers, dashes)
+            # .*               = Anything in middle (Qty, etc)
+            # (\d+\.\d{2})     = Unit Cost (18.44)
+            # \s+              = Space
+            # (\d{1,3}(?:,\d{3})*\.\d{2})$ = Line Cost (442.56)
+            
+            match = re.search(r"^(\d{1,3})\s+([A-Z0-9-]+).*\s+(\d+\.\d{2})\s+(\d{1,3}(?:,\d{3})*\.\d{2})$", line_fixed)
+            
+            if match:
+                line_num = match.group(1)
+                sku = match.group(2)
+                unit_cost = match.group(3)
+                line_cost = match.group(4)
                 
-                # Get everything before the costs
-                remaining = clean_line[:cost_match.start()].strip()
-                parts = remaining.split()
+                # Qty is the number right before the unit cost in the middle section
+                # We grab the text between SKU and Unit Cost
+                # "L-WH...   EA 1 24   18.44"
+                middle_section = line_fixed.split(sku)[1].split(unit_cost)[0]
                 
-                # We need at least 2 parts (SKU and Qty)
-                if len(parts) >= 2:
-                    qty_candidate = parts[-1]
-                    # Filter purely for digits (removes 'PC' or 'EA' noise if attached)
-                    qty = ''.join(filter(str.isdigit, qty_candidate))
-                    
-                    if not qty: continue 
+                # Find the last number in that middle section
+                qty_candidates = re.findall(r"\d+", middle_section)
+                qty = qty_candidates[-1] if qty_candidates else ""
 
-                    # Identify Line Number and SKU
-                    line_num = ""
-                    sku = ""
+                # ----------------------------------------
+                # FIND DESCRIPTION & EAN (Look at next 5 lines)
+                # ----------------------------------------
+                description = ""
+                ean = ""
+                
+                next_lines = lines[i+1 : i+6]
+                for nl in next_lines:
+                    nl_clean = nl.strip()
+                    if not nl_clean: continue
                     
-                    # Heuristic: Line Number is usually 1-3 digits at the start
-                    if parts[0].isdigit() and len(parts[0]) <= 3:
-                        line_num = parts[0]
-                        if len(parts) > 1:
-                            sku = parts[1]
-                    else:
-                        # If Line number is missing/merged, assume first part is SKU
-                        sku = parts[0]
+                    # Stop if we hit the next line item (starts with Line Number 8, 9, 10...)
+                    if re.match(r"^\d+\s+[A-Z]", nl_clean):
+                        break
 
-                    # -------------------------------------------------------
-                    # FIND DESCRIPTION & EAN (Look at next 6 lines)
-                    # -------------------------------------------------------
-                    description = ""
-                    ean = ""
+                    # EAN Finder
+                    ean_match = re.search(r"(\d{12,14})", nl_clean)
+                    if ean_match:
+                        ean = ean_match.group(1)
                     
-                    # Look ahead up to 6 lines (generous buffer)
-                    next_lines = lines[i+1 : i+7]
-                    
-                    for nl in next_lines:
-                        nl_stripped = nl.strip()
-                        if not nl_stripped: continue
-                        
-                        # Stop searching if we hit the next product (starts with digit, ends with price)
-                        if re.match(r"^\d+", nl_stripped) and re.search(r"\d+\.\d{2}$", nl_stripped):
-                            break
-                        
-                        # EAN FINDER:
-                        # Look for any 12 to 14 digit number anywhere in these lines
-                        # We do NOT require the word "EAN" to be present, as OCR often misses it.
-                        ean_candidates = re.findall(r"\b(\d{12,14})\b", nl_stripped)
-                        if ean_candidates:
-                            ean = ean_candidates[0] # Take the first valid barcode found
-                        
-                        # DESCRIPTION FINDER:
-                        # If it's not an EAN line and not a page header, it's likely the description
-                        elif "CONTINUATION" not in nl_stripped and "PAGE:" not in nl_stripped:
-                             if not description:
-                                 description = nl_stripped
+                    # Description Finder
+                    # It's usually the line that isn't the EAN and isn't a page header
+                    elif "EAN" not in nl_clean and "PAGE" not in nl_clean and "CONTINUATION" not in nl_clean:
+                        # Avoid capturing garbage like "UN PKSZ QTY" header
+                        if "VENDOR PRODUCT" not in nl_clean and not description:
+                             description = nl_clean
 
-                    extracted_data.append({
-                        "Line": line_num,
-                        "Vendor Product Number": sku,
-                        "Description": description,
-                        "EAN No": ean,
-                        "Qty": qty,
-                        "Unit Cost": unit_cost,
-                        "Line Cost": line_cost
-                    })
+                extracted_data.append({
+                    "Line": line_num,
+                    "Vendor Product Number": sku,
+                    "Description": description,
+                    "EAN No": ean,
+                    "Qty": qty,
+                    "Unit Cost": unit_cost,
+                    "Line Cost": line_cost
+                })
 
-        # 4. OUTPUT
-        # ------------------------------------------------------------------
         if extracted_data:
             df = pd.DataFrame(extracted_data)
             
-            # Sort by Line Number just in case they were read out of order
-            # (Convert to numeric first for sorting)
-            try:
-                df['Line'] = pd.to_numeric(df['Line'])
-                df = df.sort_values('Line')
-            except:
-                pass # If line numbers aren't clean, skip sorting
+            # Sort numerically by Line
+            df['Line'] = pd.to_numeric(df['Line'], errors='coerce')
+            df = df.sort_values('Line')
 
             st.success(f"Success! Found {len(df)} items.")
             st.dataframe(df)
             
             csv = df.to_csv(index=False).encode('utf-8')
-            st.download_button("Download CSV", csv, "Selfridges_PO_Final.csv", "text/csv")
+            st.download_button("Download CSV", csv, "Selfridges_PO_Fixed.csv", "text/csv")
         else:
-            st.error("No items found. Please check the 'Raw Text' below.")
-            with st.expander("Show Raw OCR Text for Debugging"):
+            st.error("No items found.")
+            with st.expander("Debug Text"):
                 st.text(all_text_content)
-            
+                
     except Exception as e:
         st.error(f"Error: {str(e)}")
